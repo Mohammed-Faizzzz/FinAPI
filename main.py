@@ -7,7 +7,9 @@ from slowapi import Limiter, _rate_limit_exceeded_handler
 from slowapi.util import get_remote_address
 from typing import List
 import asyncio
+import json
 from dotenv import load_dotenv
+from fastapi import WebSocket, WebSocketDisconnect
 
 load_dotenv()
 
@@ -24,6 +26,14 @@ limiter = Limiter(key_func=get_remote_address)
 app = FastAPI()
 app.state.limiter = limiter
 app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
+
+POPULAR_TICKERS = {"AAPL", "MSFT", "GOOGL", "TSLA", "AMZN", "META", "NVDA", "BTC", "ETH"}
+
+def get_ttl(symbol: str) -> int:
+    symbol = symbol.upper()
+    if symbol in POPULAR_TICKERS:
+        return 30
+    return 120
 
 async def fetch_stock_price(symbol: str) -> dict:
     """
@@ -64,7 +74,7 @@ async def get_stock(symbol: str, request: Request):
     data = await fetch_stock_price(symbol)
 
     # Save to Redis with TTL (e.g. 60s)
-    await redis_client.set(key, str(data), ex=60)
+    await redis_client.set(key, json.dumps(data), ex=get_ttl(symbol))
 
     return {"symbol": symbol, "cached": False, "data": data}
 
@@ -83,8 +93,32 @@ async def get_batch(symbols: str, request: Request):
             return {"symbol": symbol, "cached": True, "data": eval(cached)}
 
         data = await fetch_stock_price(symbol)
-        await redis_client.set(key, str(data), ex=60)
+        await redis_client.set(key, json.dumps(data), ex=get_ttl(symbol))
         return {"symbol": symbol, "cached": False, "data": data}
 
     results = await asyncio.gather(*(get_one(sym) for sym in tickers))
     return {"results": results}
+
+@app.websocket("/ws/{symbol}")
+async def websocket_endpoint(websocket: WebSocket, symbol: str):
+    await websocket.accept()
+    symbol = symbol.upper()
+    try:
+        while True:
+            key = f"stock:{symbol}"
+            cached = await redis_client.get(key)
+
+            if cached:
+                data = json.loads(cached)
+            else:
+                # fetch + cache if not available
+                data = await fetch_stock_price(symbol)
+                await redis_client.set(key, json.dumps(data), ex=get_ttl(symbol))
+
+            # push update to client
+            await websocket.send_json(data)
+
+            # wait until next refresh cycle
+            await asyncio.sleep(get_ttl(symbol))
+    except WebSocketDisconnect:
+        print(f"Client disconnected from {symbol}")
