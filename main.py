@@ -2,6 +2,11 @@ import os
 import httpx
 import redis.asyncio as redis
 from fastapi import FastAPI
+from slowapi import Limiter
+from slowapi.util import get_remote_address
+from slowapi.errors import RateLimitExceeded
+from typing import List
+import asyncio
 from dotenv import load_dotenv
 
 load_dotenv()
@@ -56,3 +61,23 @@ async def get_stock(symbol: str):
     await redis_client.set(key, str(data), ex=60)
 
     return {"symbol": symbol, "cached": False, "data": data}
+
+@app.get("/batch")
+async def get_batch(symbols: str):
+    """
+    Example: /batch?symbols=AAPL,MSFT,TSLA
+    """
+    tickers = [s.strip().upper() for s in symbols.split(",")]
+
+    async def get_one(symbol):
+        key = f"stock:{symbol}"
+        cached = await redis_client.get(key)
+        if cached:
+            return {"symbol": symbol, "cached": True, "data": eval(cached)}
+
+        data = await fetch_stock_price(symbol)
+        await redis_client.set(key, str(data), ex=60)
+        return {"symbol": symbol, "cached": False, "data": data}
+
+    results = await asyncio.gather(*(get_one(sym) for sym in tickers))
+    return {"results": results}
